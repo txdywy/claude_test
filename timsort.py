@@ -1,8 +1,11 @@
 """
 Timsort — a hybrid stable sorting algorithm combining merge sort and insertion sort.
-All comparisons use only the < operator for __lt__ compatibility.
-Supports key and reverse parameters matching Python's sorted() interface.
+Performance-optimized pure Python: inlined gallop, bisect for binary search,
+append+writeback merge, aggressive local variable caching.
+All comparisons use only < for __lt__ compatibility.
 """
+
+from bisect import bisect_left as _bisect_left, bisect_right as _bisect_right
 
 MIN_MERGE = 32
 MIN_GALLOP = 7
@@ -19,16 +22,10 @@ def _compute_minrun(n):
 def _insertion_sort(arr, lo, hi):
     for i in range(lo + 1, hi):
         key = arr[i]
-        left, right = lo, i
-        while left < right:
-            mid = (left + right) >> 1
-            if key < arr[mid]:
-                right = mid
-            else:
-                left = mid + 1
-        # Slice assignment: shifts in C layer, faster than Python loop
-        arr[left + 1:i + 1] = arr[left:i]
-        arr[left] = key
+        # bisect_right gives us the insertion point (C-implemented)
+        p = _bisect_right(arr, key, lo, i)
+        arr[p + 1:i + 1] = arr[p:i]
+        arr[p] = key
 
 
 def _count_run(arr, lo, hi):
@@ -45,8 +42,10 @@ def _count_run(arr, lo, hi):
     return run_hi
 
 
+# Standalone gallop functions — used only in merge_at for run trimming.
+# Inside merge_lo/merge_hi, gallop is fully inlined to avoid call overhead.
+
 def _gallop_right(key, arr, base, length):
-    """bisect_right: all arr[base..base+k-1] <= key."""
     if length == 0:
         return 0
     if key < arr[base]:
@@ -58,18 +57,11 @@ def _gallop_right(key, arr, base, length):
         ofs = (ofs << 1) + 1
         if ofs > length:
             ofs = length
-    last_ofs += 1
-    while last_ofs < ofs:
-        mid = last_ofs + ((ofs - last_ofs) >> 1)
-        if key < arr[base + mid]:
-            ofs = mid
-        else:
-            last_ofs = mid + 1
-    return ofs
+    # Use C bisect for the binary search phase
+    return _bisect_right(arr, key, base + last_ofs + 1, base + ofs) - base
 
 
 def _gallop_left(key, arr, base, length):
-    """bisect_left: all arr[base..base+k-1] < key."""
     if length == 0:
         return 0
     if not (arr[base] < key):
@@ -81,19 +73,10 @@ def _gallop_left(key, arr, base, length):
         ofs = (ofs << 1) + 1
         if ofs > length:
             ofs = length
-    last_ofs += 1
-    while last_ofs < ofs:
-        mid = last_ofs + ((ofs - last_ofs) >> 1)
-        if arr[base + mid] < key:
-            last_ofs = mid + 1
-        else:
-            ofs = mid
-    return ofs
+    return _bisect_left(arr, key, base + last_ofs + 1, base + ofs) - base
 
 
 class _TimSortState:
-    """Holds persistent state across merges: reusable temp buffer and min_gallop."""
-
     __slots__ = ('arr', 'tmp', 'min_gallop', 'stack')
 
     def __init__(self, arr):
@@ -113,12 +96,16 @@ class _TimSortState:
         tmp = self.tmp
         tmp[:left_len] = arr[lo:mid]
 
-        i, j, k = 0, mid, lo
+        # Cache everything as locals
+        i = 0; j = mid; k = lo
         mg = self.min_gallop
+        _bl = _bisect_left
+        _br = _bisect_right
 
         while i < left_len and j < hi:
             count_l = count_r = 0
 
+            # --- One-pair-at-a-time ---
             while i < left_len and j < hi:
                 if arr[j] < tmp[i]:
                     arr[k] = arr[j]; k += 1; j += 1
@@ -134,9 +121,22 @@ class _TimSortState:
             if i >= left_len or j >= hi:
                 break
 
-            # Galloping mode
+            # --- Inlined galloping ---
             while i < left_len and j < hi:
-                cnt = _gallop_left(tmp[i], arr, j, hi - j)
+                # Gallop left[i] into right run: find how many right < left[i]
+                # Inline _gallop_left(tmp[i], arr, j, hi-j)
+                key = tmp[i]
+                if arr[j] < key:
+                    ofs = 1; last_ofs = 0; length = hi - j
+                    while ofs < length and arr[j + ofs] < key:
+                        last_ofs = ofs
+                        ofs = (ofs << 1) + 1
+                        if ofs > length:
+                            ofs = length
+                    cnt = _bl(arr, key, j + last_ofs + 1, j + ofs) - j
+                else:
+                    cnt = 0
+
                 if cnt:
                     arr[k:k + cnt] = arr[j:j + cnt]
                     k += cnt; j += cnt
@@ -147,7 +147,20 @@ class _TimSortState:
                 if i >= left_len:
                     break
 
-                cnt = _gallop_right(arr[j], tmp, i, left_len - i)
+                # Gallop right[j] into left run: find how many left <= right[j]
+                # Inline _gallop_right(arr[j], tmp, i, left_len-i)
+                key = arr[j]
+                if not (key < tmp[i]):
+                    ofs = 1; last_ofs = 0; length = left_len - i
+                    while ofs < length and not (key < tmp[i + ofs]):
+                        last_ofs = ofs
+                        ofs = (ofs << 1) + 1
+                        if ofs > length:
+                            ofs = length
+                    cnt = _br(tmp, key, i + last_ofs + 1, i + ofs) - i
+                else:
+                    cnt = 0
+
                 if cnt:
                     arr[k:k + cnt] = tmp[i:i + cnt]
                     k += cnt; i += cnt
@@ -173,12 +186,15 @@ class _TimSortState:
         tmp = self.tmp
         tmp[:right_len] = arr[mid:hi]
 
-        i, j, k = mid - 1, right_len - 1, hi - 1
+        i = mid - 1; j = right_len - 1; k = hi - 1
         mg = self.min_gallop
+        _bl = _bisect_left
+        _br = _bisect_right
 
         while i >= lo and j >= 0:
             count_l = count_r = 0
 
+            # --- One-pair-at-a-time (right to left) ---
             while i >= lo and j >= 0:
                 if tmp[j] < arr[i]:
                     arr[k] = arr[i]; k -= 1; i -= 1
@@ -194,10 +210,25 @@ class _TimSortState:
             if i < lo or j < 0:
                 break
 
-            # Galloping mode (right to left)
+            # --- Inlined galloping (right to left) ---
             while i >= lo and j >= 0:
+                # How many left-run elements from right end are > tmp[j]?
+                # Inline _gallop_right(tmp[j], arr, lo, i-lo+1) then take tail
+                key = tmp[j]
                 left_len_now = i - lo + 1
-                gallop_k = _gallop_right(tmp[j], arr, lo, left_len_now)
+                if not (key < arr[lo]):
+                    ofs = 1; last_ofs = 0
+                    while ofs < left_len_now and not (key < arr[lo + ofs]):
+                        last_ofs = ofs
+                        ofs = (ofs << 1) + 1
+                        if ofs > left_len_now:
+                            ofs = left_len_now
+                    gallop_k = _br(arr, key, lo + last_ofs + 1, lo + ofs) - lo
+                elif key < arr[lo]:
+                    gallop_k = 0
+                else:
+                    gallop_k = 0
+
                 cnt = left_len_now - gallop_k
                 if cnt:
                     arr[k - cnt + 1:k + 1] = arr[i - cnt + 1:i + 1]
@@ -209,8 +240,21 @@ class _TimSortState:
                 if j < 0:
                     break
 
+                # How many right-run elements from right end are >= arr[i]?
+                # Inline _gallop_left(arr[i], tmp, 0, j+1) then take tail
+                key = arr[i]
                 right_len_now = j + 1
-                gallop_k = _gallop_left(arr[i], tmp, 0, right_len_now)
+                if tmp[0] < key:
+                    ofs = 1; last_ofs = 0
+                    while ofs < right_len_now and tmp[ofs] < key:
+                        last_ofs = ofs
+                        ofs = (ofs << 1) + 1
+                        if ofs > right_len_now:
+                            ofs = right_len_now
+                    gallop_k = _bl(tmp, key, last_ofs + 1, ofs)
+                else:
+                    gallop_k = 0
+
                 cnt = right_len_now - gallop_k
                 if cnt:
                     arr[k - cnt + 1:k + 1] = tmp[j - cnt + 1:j + 1]
@@ -236,7 +280,6 @@ class _TimSortState:
         lo1, len1 = stack[idx]
         lo2, len2 = stack[idx + 1]
 
-        # Update stack
         stack[idx] = (lo1, len1 + len2)
         if idx == len(stack) - 3:
             stack[idx + 1] = stack[idx + 2]
@@ -245,19 +288,15 @@ class _TimSortState:
         mid = lo1 + len1
         hi = lo2 + len2
 
-        # --- Run trimming ---
-        # Skip left-run prefix that's already in place
+        # Run trimming
         trim = _gallop_right(arr[mid], arr, lo1, len1)
-        lo1 += trim
-        len1 -= trim
+        lo1 += trim; len1 -= trim
         if len1 == 0:
             return
 
-        # Skip right-run suffix that's already in place
         len2 = _gallop_left(arr[mid - 1], arr, mid, len2)
         if len2 == 0:
             return
-
         hi = mid + len2
 
         if len1 <= len2:
@@ -318,12 +357,7 @@ class _TimSortState:
 
 
 def timsort(arr, *, key=None, reverse=False):
-    """Sort arr in-place using Timsort. Returns arr for convenience.
-
-    Args:
-        key: Function applied to each element for comparison (like sorted()).
-        reverse: If True, sort in descending order.
-    """
+    """Sort arr in-place using Timsort. Returns arr for convenience."""
     if key is not None or reverse:
         if key is not None and reverse:
             wrapped = [(_Reverse(key(x)), i, x) for i, x in enumerate(arr)]
@@ -340,11 +374,8 @@ def timsort(arr, *, key=None, reverse=False):
 
 
 class _Reverse:
-    """Wrapper that reverses < comparison for reverse=True support."""
     __slots__ = ('val',)
-
     def __init__(self, val):
         self.val = val
-
     def __lt__(self, other):
         return other.val < self.val
