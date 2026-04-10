@@ -325,8 +325,6 @@ def timsort(arr, *, key=None, reverse=False):
         reverse: If True, sort in descending order.
     """
     if key is not None or reverse:
-        # Decorate-sort-undecorate for key/reverse support
-        decorated = True
         if key is not None and reverse:
             wrapped = [(_Reverse(key(x)), i, x) for i, x in enumerate(arr)]
         elif key is not None:
