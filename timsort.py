@@ -42,6 +42,52 @@ def _count_run(arr, lo, hi):
     return run_hi
 
 
+def _sample_run_len(arr, lo, hi):
+    if lo + 1 >= hi:
+        return 1
+    run_hi = lo + 1
+    if arr[run_hi] < arr[lo]:
+        while run_hi < hi and arr[run_hi] < arr[run_hi - 1]:
+            run_hi += 1
+    else:
+        while run_hi < hi and not (arr[run_hi] < arr[run_hi - 1]):
+            run_hi += 1
+    return run_hi - lo
+
+
+def _choose_min_merge(arr):
+    n = len(arr)
+    if n < 128:
+        return MIN_MERGE
+
+    sample_hi = min(n, 512)
+    lo = 0
+    runs = 0
+    total = 0
+    longest = 0
+
+    while lo < sample_hi and runs < 8:
+        run_len = _sample_run_len(arr, lo, sample_hi)
+        total += run_len
+        if run_len > longest:
+            longest = run_len
+        lo += run_len
+        runs += 1
+
+    avg = total / runs if runs else 1
+    if avg >= 48 or longest >= 96:
+        return 16
+    if avg >= 24 or longest >= 48:
+        return 24
+    if avg >= 12:
+        return 32
+    if avg <= 4:
+        return 80 if n >= 4096 else 64
+    if avg <= 6:
+        return 64
+    return 48
+
+
 # Standalone gallop functions — used only in merge_at for run trimming.
 # Inside merge_lo/merge_hi, gallop is fully inlined to avoid call overhead.
 
@@ -77,18 +123,49 @@ def _gallop_left(key, arr, base, length):
 
 
 class _TimSortState:
-    __slots__ = ('arr', 'tmp', 'min_gallop', 'stack', 'min_merge')
+    __slots__ = (
+        'arr',
+        'tmp',
+        'min_gallop',
+        'run_base',
+        'run_len',
+        'stack_size',
+        'min_merge',
+    )
 
     def __init__(self, arr, min_merge=MIN_MERGE):
         self.arr = arr
         self.tmp = []
         self.min_gallop = MIN_GALLOP
-        self.stack = []
+        self.run_base = []
+        self.run_len = []
+        self.stack_size = 0
         self.min_merge = min_merge
 
     def _ensure_tmp(self, needed):
         if len(self.tmp) < needed:
             self.tmp = [None] * needed
+
+    def _push_run(self, base, length):
+        self.run_base.append(base)
+        self.run_len.append(length)
+        self.stack_size += 1
+
+    def _merge_len1(self, lo, mid, hi):
+        arr = self.arr
+        key = arr[lo]
+        pos = _bisect_left(arr, key, mid, hi)
+        if pos > mid:
+            arr[lo:pos - 1] = arr[mid:pos]
+            arr[pos - 1] = key
+
+    def _merge_len2(self, lo, mid, hi):
+        arr = self.arr
+        key = arr[mid]
+        pos = _bisect_right(arr, key, lo, mid)
+        if pos < mid:
+            arr[pos + 1:hi] = arr[pos:mid]
+            arr[pos] = key
 
     def merge_lo(self, lo, mid, hi):
         arr = self.arr
@@ -97,24 +174,25 @@ class _TimSortState:
         tmp = self.tmp
         tmp[:left_len] = arr[lo:mid]
 
-        # Cache everything as locals
-        i = 0; j = mid; k = lo
+        i = 0; j = mid
         mg = self.min_gallop
         _bl = _bisect_left
         _br = _bisect_right
+        out = []
+        append = out.append
+        extend = out.extend
 
         while i < left_len and j < hi:
             count_l = count_r = 0
 
-            # --- One-pair-at-a-time ---
             while i < left_len and j < hi:
                 if arr[j] < tmp[i]:
-                    arr[k] = arr[j]; k += 1; j += 1
+                    append(arr[j]); j += 1
                     count_r += 1; count_l = 0
                     if count_r >= mg:
                         break
                 else:
-                    arr[k] = tmp[i]; k += 1; i += 1
+                    append(tmp[i]); i += 1
                     count_l += 1; count_r = 0
                     if count_l >= mg:
                         break
@@ -122,53 +200,24 @@ class _TimSortState:
             if i >= left_len or j >= hi:
                 break
 
-            # --- Inlined galloping ---
             while i < left_len and j < hi:
-                # Gallop left[i] into right run: find how many right < left[i]
-                # Inline _gallop_left(tmp[i], arr, j, hi-j)
-                key = tmp[i]
-                if arr[j] < key:
-                    ofs = 1; last_ofs = 0; length = hi - j
-                    while ofs < length and arr[j + ofs] < key:
-                        last_ofs = ofs
-                        ofs = (ofs << 1) + 1
-                        if ofs > length:
-                            ofs = length
-                    cnt = _bl(arr, key, j + last_ofs + 1, j + ofs) - j
-                else:
-                    cnt = 0
-
+                cnt = _bl(arr, tmp[i], j, hi) - j
                 if cnt:
-                    arr[k:k + cnt] = arr[j:j + cnt]
-                    k += cnt; j += cnt
+                    extend(arr[j:j + cnt]); j += cnt
                     if j >= hi:
                         break
 
-                arr[k] = tmp[i]; k += 1; i += 1
+                append(tmp[i]); i += 1
                 if i >= left_len:
                     break
 
-                # Gallop right[j] into left run: find how many left <= right[j]
-                # Inline _gallop_right(arr[j], tmp, i, left_len-i)
-                key = arr[j]
-                if not (key < tmp[i]):
-                    ofs = 1; last_ofs = 0; length = left_len - i
-                    while ofs < length and not (key < tmp[i + ofs]):
-                        last_ofs = ofs
-                        ofs = (ofs << 1) + 1
-                        if ofs > length:
-                            ofs = length
-                    cnt = _br(tmp, key, i + last_ofs + 1, i + ofs) - i
-                else:
-                    cnt = 0
-
+                cnt = _br(tmp, arr[j], i, left_len) - i
                 if cnt:
-                    arr[k:k + cnt] = tmp[i:i + cnt]
-                    k += cnt; i += cnt
+                    extend(tmp[i:i + cnt]); i += cnt
                     if i >= left_len:
                         break
 
-                arr[k] = arr[j]; k += 1; j += 1
+                append(arr[j]); j += 1
 
                 if cnt < mg:
                     mg += 1
@@ -176,8 +225,11 @@ class _TimSortState:
                 mg = max(1, mg - 1)
 
         if i < left_len:
-            arr[k:k + left_len - i] = tmp[i:left_len]
+            extend(tmp[i:left_len])
+        if j < hi:
+            extend(arr[j:hi])
 
+        arr[lo:hi] = out
         self.min_gallop = max(1, mg)
 
     def merge_hi(self, lo, mid, hi):
@@ -187,107 +239,82 @@ class _TimSortState:
         tmp = self.tmp
         tmp[:right_len] = arr[mid:hi]
 
-        i = mid - 1; j = right_len - 1; k = hi - 1
+        i = lo; j = 0
         mg = self.min_gallop
         _bl = _bisect_left
         _br = _bisect_right
+        out = []
+        append = out.append
+        extend = out.extend
 
-        while i >= lo and j >= 0:
+        while i < mid and j < right_len:
             count_l = count_r = 0
 
-            # --- One-pair-at-a-time (right to left) ---
-            while i >= lo and j >= 0:
+            while i < mid and j < right_len:
                 if tmp[j] < arr[i]:
-                    arr[k] = arr[i]; k -= 1; i -= 1
-                    count_l += 1; count_r = 0
-                    if count_l >= mg:
-                        break
-                else:
-                    arr[k] = tmp[j]; k -= 1; j -= 1
+                    append(tmp[j]); j += 1
                     count_r += 1; count_l = 0
                     if count_r >= mg:
                         break
+                else:
+                    append(arr[i]); i += 1
+                    count_l += 1; count_r = 0
+                    if count_l >= mg:
+                        break
 
-            if i < lo or j < 0:
+            if i >= mid or j >= right_len:
                 break
 
-            # --- Inlined galloping (right to left) ---
-            while i >= lo and j >= 0:
-                # How many left-run elements from right end are > tmp[j]?
-                # Inline _gallop_right(tmp[j], arr, lo, i-lo+1) then take tail
-                key = tmp[j]
-                left_len_now = i - lo + 1
-                if not (key < arr[lo]):
-                    ofs = 1; last_ofs = 0
-                    while ofs < left_len_now and not (key < arr[lo + ofs]):
-                        last_ofs = ofs
-                        ofs = (ofs << 1) + 1
-                        if ofs > left_len_now:
-                            ofs = left_len_now
-                    gallop_k = _br(arr, key, lo + last_ofs + 1, lo + ofs) - lo
-                elif key < arr[lo]:
-                    gallop_k = 0
-                else:
-                    gallop_k = 0
-
-                cnt = left_len_now - gallop_k
+            while i < mid and j < right_len:
+                cnt = _bl(tmp, arr[i], j, right_len) - j
                 if cnt:
-                    arr[k - cnt + 1:k + 1] = arr[i - cnt + 1:i + 1]
-                    k -= cnt; i -= cnt
-                    if i < lo:
+                    extend(tmp[j:j + cnt]); j += cnt
+                    if j >= right_len:
                         break
 
-                arr[k] = tmp[j]; k -= 1; j -= 1
-                if j < 0:
+                append(arr[i]); i += 1
+                if i >= mid:
                     break
 
-                # How many right-run elements from right end are >= arr[i]?
-                # Inline _gallop_left(arr[i], tmp, 0, j+1) then take tail
-                key = arr[i]
-                right_len_now = j + 1
-                if tmp[0] < key:
-                    ofs = 1; last_ofs = 0
-                    while ofs < right_len_now and tmp[ofs] < key:
-                        last_ofs = ofs
-                        ofs = (ofs << 1) + 1
-                        if ofs > right_len_now:
-                            ofs = right_len_now
-                    gallop_k = _bl(tmp, key, last_ofs + 1, ofs)
-                else:
-                    gallop_k = 0
-
-                cnt = right_len_now - gallop_k
+                cnt = _br(arr, tmp[j], i, mid) - i
                 if cnt:
-                    arr[k - cnt + 1:k + 1] = tmp[j - cnt + 1:j + 1]
-                    k -= cnt; j -= cnt
-                    if j < 0:
+                    extend(arr[i:i + cnt]); i += cnt
+                    if i >= mid:
                         break
 
-                arr[k] = arr[i]; k -= 1; i -= 1
+                append(tmp[j]); j += 1
 
                 if cnt < mg:
                     mg += 1
                     break
                 mg = max(1, mg - 1)
 
-        if j >= 0:
-            arr[lo:lo + j + 1] = tmp[:j + 1]
+        if i < mid:
+            extend(arr[i:mid])
+        if j < right_len:
+            extend(tmp[j:right_len])
 
+        arr[lo:hi] = out
         self.min_gallop = max(1, mg)
 
     def merge_at(self, idx):
-        stack = self.stack
         arr = self.arr
-        lo1, len1 = stack[idx]
-        lo2, len2 = stack[idx + 1]
+        run_base = self.run_base
+        run_len = self.run_len
+        lo1 = run_base[idx]
+        len1 = run_len[idx]
+        len2 = run_len[idx + 1]
 
-        stack[idx] = (lo1, len1 + len2)
-        if idx == len(stack) - 3:
-            stack[idx + 1] = stack[idx + 2]
-        stack.pop()
+        run_len[idx] = len1 + len2
+        if idx == self.stack_size - 3:
+            run_base[idx + 1] = run_base[idx + 2]
+            run_len[idx + 1] = run_len[idx + 2]
+        run_base.pop()
+        run_len.pop()
+        self.stack_size -= 1
 
         mid = lo1 + len1
-        hi = lo2 + len2
+        hi = mid + len2
 
         # Cheap early-return: runs already in order, skip all merge work
         if not (arr[mid] < arr[mid - 1]):
@@ -304,30 +331,34 @@ class _TimSortState:
             return
         hi = mid + len2
 
-        if len1 <= len2:
+        if len1 == 1:
+            self._merge_len1(lo1, mid, hi)
+        elif len2 == 1:
+            self._merge_len2(lo1, mid, hi)
+        elif len1 <= len2:
             self.merge_lo(lo1, mid, hi)
         else:
             self.merge_hi(lo1, mid, hi)
 
     def merge_collapse(self):
-        stack = self.stack
-        while len(stack) > 1:
-            n = len(stack) - 2
-            if n > 0 and not (stack[n][1] + stack[n + 1][1] < stack[n - 1][1]):
-                if stack[n - 1][1] < stack[n + 1][1]:
+        run_len = self.run_len
+        while self.stack_size > 1:
+            n = self.stack_size - 2
+            if n > 0 and not (run_len[n] + run_len[n + 1] < run_len[n - 1]):
+                if run_len[n - 1] < run_len[n + 1]:
                     self.merge_at(n - 1)
                 else:
                     self.merge_at(n)
-            elif not (stack[n + 1][1] < stack[n][1]):
+            elif not (run_len[n + 1] < run_len[n]):
                 self.merge_at(n)
             else:
                 break
 
     def merge_force_collapse(self):
-        stack = self.stack
-        while len(stack) > 1:
-            n = len(stack) - 2
-            if n > 0 and stack[n - 1][1] < stack[n + 1][1]:
+        run_len = self.run_len
+        while self.stack_size > 1:
+            n = self.stack_size - 2
+            if n > 0 and run_len[n - 1] < run_len[n + 1]:
                 self.merge_at(n - 1)
             else:
                 self.merge_at(n)
@@ -355,7 +386,7 @@ class _TimSortState:
                 _insertion_sort(arr, lo, lo + force)
                 run_len = force
 
-            self.stack.append((lo, run_len))
+            self._push_run(lo, run_len)
             self.merge_collapse()
             lo += run_len
 
@@ -368,11 +399,8 @@ def timsort(arr, *, key=None, reverse=False, min_merge=None):
     Args:
         key: Function applied to each element for comparison.
         reverse: If True, sort in descending order.
-        min_merge: Override MIN_MERGE threshold (default 64). Must be >= 2.
+        min_merge: Override MIN_MERGE threshold. If omitted, auto-tune per input.
     """
-    mm = MIN_MERGE if min_merge is None else min_merge
-    if not isinstance(mm, int) or mm < 2:
-        raise ValueError("min_merge must be an integer >= 2")
     if key is not None or reverse:
         if key is not None and reverse:
             wrapped = [(_Reverse(key(x)), i, x) for i, x in enumerate(arr)]
@@ -380,10 +408,16 @@ def timsort(arr, *, key=None, reverse=False, min_merge=None):
             wrapped = [(key(x), i, x) for i, x in enumerate(arr)]
         else:
             wrapped = [(_Reverse(x), i, x) for i, x in enumerate(arr)]
+        mm = _choose_min_merge(wrapped) if min_merge is None else min_merge
+        if not isinstance(mm, int) or mm < 2:
+            raise ValueError("min_merge must be an integer >= 2")
         _TimSortState(wrapped, mm).sort()
         for i, (_, _, v) in enumerate(wrapped):
             arr[i] = v
     else:
+        mm = _choose_min_merge(arr) if min_merge is None else min_merge
+        if not isinstance(mm, int) or mm < 2:
+            raise ValueError("min_merge must be an integer >= 2")
         _TimSortState(arr, mm).sort()
     return arr
 
