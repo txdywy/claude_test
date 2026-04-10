@@ -7,7 +7,7 @@ All comparisons use only < for __lt__ compatibility.
 
 from bisect import bisect_left as _bisect_left, bisect_right as _bisect_right
 
-MIN_MERGE = 32
+MIN_MERGE = 64
 MIN_GALLOP = 7
 
 
@@ -288,6 +288,10 @@ class _TimSortState:
         mid = lo1 + len1
         hi = lo2 + len2
 
+        # Cheap early-return: runs already in order, skip all merge work
+        if not (arr[mid] < arr[mid - 1]):
+            return
+
         # Run trimming
         trim = _gallop_right(arr[mid], arr, lo1, len1)
         lo1 += trim; len1 -= trim
@@ -356,20 +360,33 @@ class _TimSortState:
         self.merge_force_collapse()
 
 
-def timsort(arr, *, key=None, reverse=False):
-    """Sort arr in-place using Timsort. Returns arr for convenience."""
-    if key is not None or reverse:
-        if key is not None and reverse:
-            wrapped = [(_Reverse(key(x)), i, x) for i, x in enumerate(arr)]
-        elif key is not None:
-            wrapped = [(key(x), i, x) for i, x in enumerate(arr)]
+def timsort(arr, *, key=None, reverse=False, min_merge=None):
+    """Sort arr in-place using Timsort. Returns arr for convenience.
+
+    Args:
+        key: Function applied to each element for comparison.
+        reverse: If True, sort in descending order.
+        min_merge: Override MIN_MERGE threshold (default 64). Tune per workload.
+    """
+    global MIN_MERGE
+    old_mm = MIN_MERGE
+    if min_merge is not None:
+        MIN_MERGE = min_merge
+    try:
+        if key is not None or reverse:
+            if key is not None and reverse:
+                wrapped = [(_Reverse(key(x)), x) for x in arr]
+            elif key is not None:
+                wrapped = [(key(x), x) for x in arr]
+            else:
+                wrapped = [(_Reverse(x), x) for x in arr]
+            _TimSortState(wrapped).sort()
+            for i, (_, v) in enumerate(wrapped):
+                arr[i] = v
         else:
-            wrapped = [(_Reverse(x), i, x) for i, x in enumerate(arr)]
-        _TimSortState(wrapped).sort()
-        for i, (_, _, v) in enumerate(wrapped):
-            arr[i] = v
-    else:
-        _TimSortState(arr).sort()
+            _TimSortState(arr).sort()
+    finally:
+        MIN_MERGE = old_mm
     return arr
 
 
