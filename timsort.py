@@ -11,9 +11,9 @@ MIN_MERGE = 64
 MIN_GALLOP = 7
 
 
-def _compute_minrun(n):
+def _compute_minrun(n, min_merge=MIN_MERGE):
     r = 0
-    while n >= MIN_MERGE:
+    while n >= min_merge:
         r |= n & 1
         n >>= 1
     return n + r
@@ -77,13 +77,14 @@ def _gallop_left(key, arr, base, length):
 
 
 class _TimSortState:
-    __slots__ = ('arr', 'tmp', 'min_gallop', 'stack')
+    __slots__ = ('arr', 'tmp', 'min_gallop', 'stack', 'min_merge')
 
-    def __init__(self, arr):
+    def __init__(self, arr, min_merge=MIN_MERGE):
         self.arr = arr
         self.tmp = []
         self.min_gallop = MIN_GALLOP
         self.stack = []
+        self.min_merge = min_merge
 
     def _ensure_tmp(self, needed):
         if len(self.tmp) < needed:
@@ -337,11 +338,12 @@ class _TimSortState:
         if n < 2:
             return
 
-        if n < MIN_MERGE:
+        min_merge = self.min_merge
+        if n < min_merge:
             _insertion_sort(arr, 0, n)
             return
 
-        minrun = _compute_minrun(n)
+        minrun = _compute_minrun(n, min_merge)
         lo = 0
 
         while lo < n:
@@ -366,27 +368,21 @@ def timsort(arr, *, key=None, reverse=False, min_merge=None):
     Args:
         key: Function applied to each element for comparison.
         reverse: If True, sort in descending order.
-        min_merge: Override MIN_MERGE threshold (default 64). Tune per workload.
+        min_merge: Override MIN_MERGE threshold (default 64). Must be >= 2.
     """
-    global MIN_MERGE
-    old_mm = MIN_MERGE
-    if min_merge is not None:
-        MIN_MERGE = min_merge
-    try:
-        if key is not None or reverse:
-            if key is not None and reverse:
-                wrapped = [(_Reverse(key(x)), x) for x in arr]
-            elif key is not None:
-                wrapped = [(key(x), x) for x in arr]
-            else:
-                wrapped = [(_Reverse(x), x) for x in arr]
-            _TimSortState(wrapped).sort()
-            for i, (_, v) in enumerate(wrapped):
-                arr[i] = v
+    mm = MIN_MERGE if min_merge is None else max(2, int(min_merge))
+    if key is not None or reverse:
+        if key is not None and reverse:
+            wrapped = [(_Reverse(key(x)), i, x) for i, x in enumerate(arr)]
+        elif key is not None:
+            wrapped = [(key(x), i, x) for i, x in enumerate(arr)]
         else:
-            _TimSortState(arr).sort()
-    finally:
-        MIN_MERGE = old_mm
+            wrapped = [(_Reverse(x), i, x) for i, x in enumerate(arr)]
+        _TimSortState(wrapped, mm).sort()
+        for i, (_, _, v) in enumerate(wrapped):
+            arr[i] = v
+    else:
+        _TimSortState(arr, mm).sort()
     return arr
 
 
