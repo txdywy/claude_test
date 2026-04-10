@@ -370,7 +370,9 @@ def timsort(arr, *, key=None, reverse=False, min_merge=None):
         reverse: If True, sort in descending order.
         min_merge: Override MIN_MERGE threshold (default 64). Must be >= 2.
     """
-    mm = MIN_MERGE if min_merge is None else max(2, int(min_merge))
+    mm = MIN_MERGE if min_merge is None else min_merge
+    if not isinstance(mm, int) or mm < 2:
+        raise ValueError("min_merge must be an integer >= 2")
     if key is not None or reverse:
         if key is not None and reverse:
             wrapped = [(_Reverse(key(x)), i, x) for i, x in enumerate(arr)]
