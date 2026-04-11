@@ -1,70 +1,76 @@
 #!/usr/bin/env python3
-"""Benchmark harness for timsort — compare against built-in, test MIN_MERGE values."""
-import time, random, sys
-from timsort import timsort
+"""Benchmark: timsort.py vs timsort_cc.py"""
 
-N = int(sys.argv[1]) if len(sys.argv) > 1 else 100000
+import time
+import random
+import statistics
+import sys
+
+sys.path.insert(0, '.')
+
+from timsort import timsort as timsort_orig
+from timsort_cc import timsort as timsort_cc
+
+WARMUP = 3
 RUNS = 5
+SIZES = [1000, 10000, 100000]
 
-SCENARIOS = [
-    ('random',        lambda n: [random.randint(0, n) for _ in range(n)]),
-    ('sorted',        lambda n: list(range(n))),
-    ('reverse',       lambda n: list(range(n, 0, -1))),
-    ('mostly sorted', lambda n: list(range(n)) + [random.randint(0, n) for _ in range(n // 10)]),
-    ('few unique',    lambda n: [random.randint(0, 10) for _ in range(n)]),
-    ('all equal',     lambda n: [42] * n),
-    ('sawtooth',      lambda n: [i % 100 for i in range(n)]),
-    ('pipe organ',    lambda n: list(range(n // 2)) + list(range(n // 2, 0, -1))),
-]
+def make_data(size, pattern):
+    random.seed(42)
+    if pattern == "random":
+        return [random.random() for _ in range(size)]
+    elif pattern == "sorted":
+        return list(range(size))
+    elif pattern == "reverse":
+        return list(range(size, 0, -1))
+    elif pattern == "nearly_sorted":
+        data = list(range(size))
+        swaps = max(size // 100, 10)
+        for _ in range(swaps):
+            i, j = random.randint(0, size - 1), random.randint(0, size - 1)
+            data[i], data[j] = data[j], data[i]
+        return data
+    elif pattern == "many_runs":
+        data = []
+        run_len = max(size // 500, 4)
+        for i in range(0, size, run_len):
+            chunk = list(range(i, min(i + run_len, size)))
+            random.shuffle(chunk)
+            data.extend(chunk)
+        return data[:size]
+    elif pattern == "few_unique":
+        return [random.randint(0, 10) for _ in range(size)]
+    return [random.random() for _ in range(size)]
 
-def bench(sort_fn, gen, n, runs=RUNS):
-    times = []
-    for _ in range(runs):
-        random.seed(42)
-        a = gen(n)
-        t0 = time.perf_counter()
-        sort_fn(a)
-        times.append(time.perf_counter() - t0)
-    return min(times) * 1000  # best-of for less noise
+def bench(fn, data, name):
+    arr = list(data)
+    start = time.perf_counter()
+    fn(arr)
+    elapsed = time.perf_counter() - start
+    assert all(arr[i] <= arr[i + 1] for i in range(len(arr) - 1)), f"{name}: not sorted!"
+    return elapsed
 
-def section(title):
-    print(f'\n{"=" * 70}\n{title}\n{"=" * 70}')
+patterns = ["random", "sorted", "reverse", "nearly_sorted", "many_runs", "few_unique"]
 
-# --- 1. Main comparison ---
-section(f'Timsort vs built-in (n={N}, best of {RUNS})')
-print(f'{"Scenario":25s} {"Ours (ms)":>10s} {"Built-in":>10s} {"Ratio":>8s}')
-print('-' * 56)
-for name, gen in SCENARIOS:
-    ours = bench(timsort, gen, N)
-    builtin = bench(list.sort, gen, N)
-    ratio = ours / builtin if builtin > 0.001 else 0
-    print(f'{name:25s} {ours:10.2f} {builtin:10.2f} {ratio:7.1f}x')
+print(f"{'Pattern':<16} {'Size':>8} {'Original (ms)':>14} {'CC (ms)':>10} {'Speedup':>10}")
+print("-" * 64)
 
-# --- 2. MIN_MERGE tuning ---
-section(f'MIN_MERGE tuning (n={N})')
-test_scenarios = [
-    ('random',   lambda n: [random.randint(0, n) for _ in range(n)]),
-    ('few unique', lambda n: [random.randint(0, 10) for _ in range(n)]),
-    ('mostly sorted', lambda n: list(range(n)) + [random.randint(0, n) for _ in range(n // 10)]),
-]
-mm_values = [16, 32, 48, 64, 96, 128]
+for pattern in patterns:
+    for size in SIZES:
+        data = make_data(size, pattern)
 
-print(f'{"Scenario":25s}', ''.join(f'{"mm=" + str(m):>10s}' for m in mm_values))
-print('-' * (25 + 10 * len(mm_values)))
-for name, gen in test_scenarios:
-    row = f'{name:25s}'
-    for mm in mm_values:
-        t = bench(lambda a: timsort(a, min_merge=mm), gen, N)
-        row += f'{t:10.2f}'
-    print(row)
+        for _ in range(WARMUP):
+            bench(timsort_orig, list(data), "warmup")
+            bench(timsort_cc, list(data), "warmup")
 
-# --- 3. key path ---
-section(f'key/reverse overhead (n={N // 2})')
-n2 = N // 2
-gen = lambda n: [random.randint(0, n) for _ in range(n)]
-t_plain = bench(timsort, gen, n2)
-t_key = bench(lambda a: timsort(a, key=lambda x: -x), gen, n2)
-t_rev = bench(lambda a: timsort(a, reverse=True), gen, n2)
-print(f'  plain:   {t_plain:.2f} ms')
-print(f'  key=-x:  {t_key:.2f} ms  ({t_key/t_plain:.2f}x vs plain)')
-print(f'  reverse: {t_rev:.2f} ms  ({t_rev/t_plain:.2f}x vs plain)')
+        orig_times = []
+        cc_times = []
+        for _ in range(RUNS):
+            orig_times.append(bench(timsort_orig, list(data), "orig") * 1000)
+            cc_times.append(bench(timsort_cc, list(data), "cc") * 1000)
+
+        orig_avg = statistics.mean(orig_times)
+        cc_avg = statistics.mean(cc_times)
+        speedup = orig_avg / cc_avg if cc_avg > 0 else float('inf')
+
+        print(f"{pattern:<16} {size:>8} {orig_avg:>14.3f} {cc_avg:>10.3f} {speedup:>9.2f}x")

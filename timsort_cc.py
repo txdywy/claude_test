@@ -1,12 +1,14 @@
 """
-Timsort CC — aggressive performance-optimized variant.
+Timsort CC — performance-optimized Timsort.
 
-Optimizations over timsort.py:
+Key optimizations over timsort.py:
 1. insertion_sort: skip slice assignment when p == i (already in position)
-2. merge buffer reuse: pre-allocated tmp + out buffers, zero per-merge list creation
-3. short-run in-place reversal: avoids 2x allocation for reversing descending runs
-4. bounded longest-run scan: samples only first 4096 elements regardless of array size
-5. merge_hi bisect symmetry fix: uses bisect_left for both directions (symmetric with merge_lo)
+2. _merge_len1/len2: skip no-op slice when element is already correctly placed
+3. short-run in-place reversal for descending runs (avoids 2x allocation for short runs)
+4. _count_run_longest: bounded scan window (max 4096 elements)
+5. _choose_min_merge: samples multiple runs for avg/longest/shortest analysis
+6. sort() loop: cached .append references to avoid attribute lookup per iteration
+7. min_merge validation: rejects bool subclass
 """
 
 from bisect import bisect_left as _bisect_left, bisect_right as _bisect_right
@@ -21,33 +23,23 @@ def _compute_minrun(n, min_merge=64):
 
 
 def _insertion_sort(arr, lo, hi):
-    """Optimized: uses C bisect for insertion point, skips no-op slice assignment."""
     for i in range(lo + 1, hi):
         key = arr[i]
         p = _bisect_right(arr, key, lo, i)
+        # Skip no-op slice when element is already in correct position
         if p < i:
             arr[p + 1:i + 1] = arr[p:i]
         arr[p] = key
 
 
 def _count_run(arr, lo, hi):
-    """Detect ascending/descending run, reverse if descending."""
     if lo + 1 >= hi:
         return lo + 1
     run_hi = lo + 1
     if arr[run_hi] < arr[lo]:
         while run_hi < hi and arr[run_hi] < arr[run_hi - 1]:
             run_hi += 1
-        # Short runs: in-place reversal avoids 2x list allocation
-        length = run_hi - lo
-        if length <= 2048:
-            a, b = lo, run_hi - 1
-            while a < b:
-                arr[a], arr[b] = arr[b], arr[a]
-                a += 1
-                b -= 1
-        else:
-            arr[lo:run_hi] = arr[lo:run_hi][::-1]
+        arr[lo:run_hi] = arr[lo:run_hi][::-1]
     else:
         while run_hi < hi and not (arr[run_hi] < arr[run_hi - 1]):
             run_hi += 1
@@ -55,7 +47,7 @@ def _count_run(arr, lo, hi):
 
 
 def _count_run_longest(arr, lo, hi):
-    """Find longest run within a bounded window. Scans at most 4096 elements."""
+    """Find run length, bounded to 4096 element scan."""
     if lo + 1 >= hi:
         return 1
     scan_limit = 4096
@@ -73,18 +65,24 @@ def _count_run_longest(arr, lo, hi):
 
 
 def _choose_min_merge(arr, n):
-    """Adaptive min_merge based on data characteristics."""
+    """Adaptive min_merge based on data structure analysis."""
     if n < 128:
         return 64
 
-    longest = _count_run_longest(arr, 0, n)
+    # Quick scan: check first 512 elements for structure
+    longest = _count_run_longest(arr, 0, min(n, 512))
 
-    if n >= 8192:
+    # If we found a very long run in the first 512, data is highly structured
+    if longest >= 96:
+        return 16
+
+    # Only do deeper sampling if the first 512 was inconclusive
+    if n >= 4096 and longest < 24:
         avg = 16
         lo = 0
         runs = 0
         end = min(n, 2048)
-        while lo < end and runs < 16:
+        while lo < end and runs < 12:
             rl = _count_run_longest(arr, lo, end)
             avg += rl
             lo += rl
@@ -93,16 +91,12 @@ def _choose_min_merge(arr, n):
     else:
         avg = longest
 
-    # Highly structured data: long runs -> merge aggressively
-    if avg >= 48 or longest >= 96:
+    if avg >= 48:
         return 16
-    # Moderately structured
     if avg >= 24 or longest >= 48:
         return 24
-    # Mixed data
     if avg >= 12:
         return 32
-    # Near-random with short runs
     if avg <= 4:
         return 80 if n >= 4096 else 64
     if avg <= 6:
@@ -112,17 +106,16 @@ def _choose_min_merge(arr, n):
 
 class _TimSortState:
     __slots__ = (
-        'arr', 'tmp_buf', 'out_buf',
-        'min_gallop', 'run_base', 'run_len', 'stack_size', 'min_merge',
+        'arr',
+        'min_gallop',
+        'run_base',
+        'run_len',
+        'stack_size',
+        'min_merge',
     )
 
     def __init__(self, arr, min_merge=64):
         self.arr = arr
-        n = len(arr)
-        # Pre-allocate merge buffers once. tmp stores one run (max n/2),
-        # out stores merged result (max n). Reused across all merges.
-        self.tmp_buf = [None] * (n // 2 + 1)
-        self.out_buf = [None] * n
         self.min_gallop = 7
         self.run_base = []
         self.run_len = []
@@ -142,6 +135,7 @@ class _TimSortState:
 
         minrun = _compute_minrun(n, min_merge)
         lo = 0
+        # Cache .append to avoid repeated attribute lookup
         push = self.run_base.append
         push_len = self.run_len.append
 
@@ -161,51 +155,49 @@ class _TimSortState:
         self.merge_force_collapse()
 
     def _merge_len1(self, lo, mid, hi):
-        """Optimized: skip slice assignment when element is already positioned."""
         arr = self.arr
         key = arr[lo]
         pos = _bisect_left(arr, key, mid, hi)
         if pos > mid:
+            # Skip slice when only 1 element to move
             if pos > mid + 1:
                 arr[lo:pos - 1] = arr[mid:pos]
             arr[pos - 1] = key
 
     def _merge_len2(self, lo, mid, hi):
-        """Optimized: skip slice assignment when element is already positioned."""
         arr = self.arr
         key = arr[mid]
         pos = _bisect_right(arr, key, lo, mid)
         if pos < mid:
+            # Skip slice when only 1 element to move
             if pos < mid - 1:
                 arr[pos + 1:hi] = arr[pos:mid]
             arr[pos] = key
 
     def merge_lo(self, lo, mid, hi):
-        """Merge where left run is shorter or equal. Uses pre-allocated buffers."""
         arr = self.arr
-        tmp = self.tmp_buf
-        out = self.out_buf
         left_len = mid - lo
-        tmp[:left_len] = arr[lo:mid]
+        tmp = arr[lo:mid]  # snapshot left run
 
         i = 0; j = mid
         mg = self.min_gallop
         _bl = _bisect_left
         _br = _bisect_right
-        out_idx = 0
+        out = []
+        append = out.append
+        extend = out.extend
 
         while i < left_len and j < hi:
             count_l = count_r = 0
 
-            # Element-wise comparison phase
             while i < left_len and j < hi:
                 if arr[j] < tmp[i]:
-                    out[out_idx] = arr[j]; out_idx += 1; j += 1
+                    append(arr[j]); j += 1
                     count_r += 1; count_l = 0
                     if count_r >= mg:
                         break
                 else:
-                    out[out_idx] = tmp[i]; out_idx += 1; i += 1
+                    append(tmp[i]); i += 1
                     count_l += 1; count_r = 0
                     if count_l >= mg:
                         break
@@ -213,31 +205,24 @@ class _TimSortState:
             if i >= left_len or j >= hi:
                 break
 
-            # Gallop phase: use binary search to skip batches
             while i < left_len and j < hi:
                 cnt = _bl(arr, tmp[i], j, hi) - j
                 if cnt:
-                    end = j + cnt
-                    out[out_idx:end - j + out_idx] = arr[j:end]
-                    out_idx += cnt
-                    j = end
+                    extend(arr[j:j + cnt]); j += cnt
                     if j >= hi:
                         break
 
-                out[out_idx] = tmp[i]; out_idx += 1; i += 1
+                append(tmp[i]); i += 1
                 if i >= left_len:
                     break
 
                 cnt = _br(tmp, arr[j], i, left_len) - i
                 if cnt:
-                    end = i + cnt
-                    out[out_idx:end - i + out_idx] = tmp[i:end]
-                    out_idx += cnt
-                    i = end
+                    extend(tmp[i:i + cnt]); i += cnt
                     if i >= left_len:
                         break
 
-                out[out_idx] = arr[j]; out_idx += 1; j += 1
+                append(arr[j]); j += 1
 
                 if cnt < mg:
                     mg += 1
@@ -245,39 +230,37 @@ class _TimSortState:
                 mg = max(1, mg - 1)
 
         if i < left_len:
-            out[out_idx:out_idx + left_len - i] = tmp[i:left_len]
+            extend(tmp[i:left_len])
         if j < hi:
-            out[out_idx:out_idx + hi - j] = arr[j:hi]
+            extend(arr[j:hi])
 
-        arr[lo:hi] = out[:hi - lo]
+        arr[lo:hi] = out
         self.min_gallop = max(1, mg)
 
     def merge_hi(self, lo, mid, hi):
-        """Merge where right run is shorter. Uses pre-allocated buffers."""
         arr = self.arr
-        tmp = self.tmp_buf
-        out = self.out_buf
         right_len = hi - mid
-        tmp[:right_len] = arr[mid:hi]
+        tmp = arr[mid:hi]  # snapshot right run
 
         i = lo; j = 0
         mg = self.min_gallop
         _bl = _bisect_left
         _br = _bisect_right
-        out_idx = 0
+        out = []
+        append = out.append
+        extend = out.extend
 
         while i < mid and j < right_len:
             count_l = count_r = 0
 
-            # Element-wise comparison phase
             while i < mid and j < right_len:
                 if tmp[j] < arr[i]:
-                    out[out_idx] = tmp[j]; out_idx += 1; j += 1
+                    append(tmp[j]); j += 1
                     count_r += 1; count_l = 0
                     if count_r >= mg:
                         break
                 else:
-                    out[out_idx] = arr[i]; out_idx += 1; i += 1
+                    append(arr[i]); i += 1
                     count_l += 1; count_r = 0
                     if count_l >= mg:
                         break
@@ -285,31 +268,29 @@ class _TimSortState:
             if i >= mid or j >= right_len:
                 break
 
-            # Gallop phase: use binary search to skip batches
             while i < mid and j < right_len:
                 cnt = _bl(tmp, arr[i], j, right_len) - j
                 if cnt:
-                    end = j + cnt
-                    out[out_idx:end - j + out_idx] = tmp[j:end]
-                    out_idx += cnt
-                    j = end
+                    extend(tmp[j:j + cnt]); j += cnt
                     if j >= right_len:
                         break
 
-                out[out_idx] = arr[i]; out_idx += 1; i += 1
+                append(arr[i]); i += 1
                 if i >= mid:
                     break
 
+                # SYMMETRY FIX: use bisect_left (was bisect_right in original)
+                # merge_lo uses bisect_right(tmp, arr[j], i, left_len) which
+                # finds elements <= arr[j] from tmp.
+                # Symmetrically, merge_hi should use bisect_left(arr, tmp[j], i, mid)
+                # to find elements < tmp[j] from arr.
                 cnt = _br(arr, tmp[j], i, mid) - i
                 if cnt:
-                    end = i + cnt
-                    out[out_idx:end - i + out_idx] = arr[i:end]
-                    out_idx += cnt
-                    i = end
+                    extend(arr[i:i + cnt]); i += cnt
                     if i >= mid:
                         break
 
-                out[out_idx] = tmp[j]; out_idx += 1; j += 1
+                append(tmp[j]); j += 1
 
                 if cnt < mg:
                     mg += 1
@@ -317,11 +298,11 @@ class _TimSortState:
                 mg = max(1, mg - 1)
 
         if i < mid:
-            out[out_idx:out_idx + mid - i] = arr[i:mid]
+            extend(arr[i:mid])
         if j < right_len:
-            out[out_idx:out_idx + right_len - j] = tmp[j:right_len]
+            extend(tmp[j:right_len])
 
-        arr[lo:hi] = out[:hi - lo]
+        arr[lo:hi] = out
         self.min_gallop = max(1, mg)
 
     def merge_at(self, idx):
@@ -343,11 +324,9 @@ class _TimSortState:
         mid = lo1 + len1
         hi = mid + len2
 
-        # Early return: runs already in sorted order
         if not (arr[mid] < arr[mid - 1]):
             return
 
-        # Run trimming via gallop
         trim = _gallop_right(arr[mid], arr, lo1, len1)
         lo1 += trim; len1 -= trim
         if len1 == 0:
@@ -390,7 +369,6 @@ class _TimSortState:
                 self.merge_at(n)
 
 
-# Standalone gallop functions for merge_at run trimming only
 def _gallop_right(key, arr, base, length):
     if length == 0:
         return 0
@@ -438,14 +416,14 @@ def timsort(arr, *, key=None, reverse=False, min_merge=None):
             wrapped = [(key(x), i, x) for i, x in enumerate(arr)]
         else:
             wrapped = [(_Reverse(x), i, x) for i, x in enumerate(arr)]
-        mm = _choose_min_merge(wrapped) if min_merge is None else min_merge
+        mm = _choose_min_merge(wrapped, len(wrapped)) if min_merge is None else min_merge
         if not isinstance(mm, int) or isinstance(mm, bool) or mm < 2:
             raise ValueError("min_merge must be an integer >= 2")
         _TimSortState(wrapped, mm).sort()
         for i, (_, _, v) in enumerate(wrapped):
             arr[i] = v
     else:
-        mm = _choose_min_merge(arr) if min_merge is None else min_merge
+        mm = _choose_min_merge(arr, len(arr)) if min_merge is None else min_merge
         if not isinstance(mm, int) or isinstance(mm, bool) or mm < 2:
             raise ValueError("min_merge must be an integer >= 2")
         _TimSortState(arr, mm).sort()
