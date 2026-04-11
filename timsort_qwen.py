@@ -1,18 +1,21 @@
 """
-Timsort — 高性能混合稳定排序算法，结合归并排序与插入排序。
+Timsort — 最优纯 Python 实现，综合三个版本的优点。
 
-经验证有效的优化：
-1. 小运行跳过 gallop（< 16 时直接用二分查找，避免 gallop 指数探测开销）
-2. 插入排序中跳过无操作的拷贝（p == i 时不拷贝）
-3. 降低 _choose_min_merge 采样上限（512 → 256，减少几乎有序数据的采样开销）
-4. 减少函数调用开销：gallop 函数提升为模块级（避免方法调用的 self 解析）
-5. merge_at 中提前返回已排序的运行对（常见于部分有序数据）
-6. sort() 中缓存局部变量，减少属性查找
+来自 cc 版的优化：
+1. merge 时直接切片创建 tmp（去掉 self.tmp），减少 _ensure_tmp 开销
+2. _merge_len1/2 跳过单元素 slice 操作
+3. _count_run_longest 带 4096 扫描上界，防止超长 run 浪费时间
+4. 深度采样策略：先快速看 512，不确定再采样 2048
+5. min_merge 校验 bool 子类（防御性编程）
 
-未采用的"优化"（Python 中反而更慢）：
+来自 qwen 版的优化：
+6. GALLOP_THRESHOLD=16：小 run 跳过 gallop 指数探测，直接 bisect
+7. sort() 中缓存方法引用，减少属性查找
+
+已验证不采用的"优化"（Python 中反而更慢）：
 - 原地反转：Python 的 arr[::-1] 是 C 级优化的，手动循环慢 10 倍
-- 预分配合并缓冲区：创建 [None]*n 的开销超过了 append/extend 的节省
-- 手动循环拷贝：Python 切片拷贝是 C 级的，比手动 for 循环快得多
+- 预分配合并缓冲区：创建 [None]*n 的开销超过了节省
+- 手动循环拷贝：Python 切片拷贝是 C 级的，比手动 for 循环快
 """
 
 from bisect import bisect_left as _bisect_left, bisect_right as _bisect_right
@@ -34,7 +37,7 @@ def _insertion_sort(arr, lo, hi):
     for i in range(lo + 1, hi):
         key = arr[i]
         p = _bisect_right(arr, key, lo, i)
-        if p < i:  # 优化：跳过无操作的拷贝
+        if p < i:  # 跳过无操作的拷贝
             arr[p + 1:i + 1] = arr[p:i]
             arr[p] = key
 
@@ -46,7 +49,6 @@ def _count_run(arr, lo, hi):
     if arr[run_hi] < arr[lo]:
         while run_hi < hi and arr[run_hi] < arr[run_hi - 1]:
             run_hi += 1
-        # Python 的切片反转是 C 级优化的，比手动循环快 10 倍
         arr[lo:run_hi] = arr[lo:run_hi][::-1]
     else:
         while run_hi < hi and not (arr[run_hi] < arr[run_hi - 1]):
@@ -54,41 +56,52 @@ def _count_run(arr, lo, hi):
     return run_hi
 
 
-def _sample_run_len(arr, lo, hi):
+def _count_run_longest(arr, lo, hi):
+    """查找运行长度，扫描限制在 4096 个元素内"""
     if lo + 1 >= hi:
         return 1
-    run_hi = lo + 1
-    if arr[run_hi] < arr[lo]:
-        while run_hi < hi and arr[run_hi] < arr[run_hi - 1]:
+    scan_limit = 4096
+    if arr[lo + 1] < arr[lo]:
+        run_hi = lo + 1
+        end = lo + scan_limit if lo + scan_limit < hi else hi
+        while run_hi < end and arr[run_hi] < arr[run_hi - 1]:
             run_hi += 1
     else:
-        while run_hi < hi and not (arr[run_hi] < arr[run_hi - 1]):
+        run_hi = lo + 1
+        end = lo + scan_limit if lo + scan_limit < hi else hi
+        while run_hi < end and not (arr[run_hi] < arr[run_hi - 1]):
             run_hi += 1
     return run_hi - lo
 
 
-def _choose_min_merge(arr):
-    n = len(arr)
+def _choose_min_merge(arr, n):
+    """基于数据结构分析的自适应 min_merge"""
     if n < 128:
-        return MIN_MERGE
+        return 64
 
-    # 优化：降低采样上限，减少几乎有序数据的采样开销
-    sample_hi = min(n, 256)
-    lo = 0
-    runs = 0
-    total = 0
-    longest = 0
+    # 快速扫描：检查前 512 个元素的结构
+    longest = _count_run_longest(arr, 0, min(n, 512))
 
-    while lo < sample_hi and runs < 8:
-        run_len = _sample_run_len(arr, lo, sample_hi)
-        total += run_len
-        if run_len > longest:
-            longest = run_len
-        lo += run_len
-        runs += 1
+    # 如果在前 512 中找到了很长的运行，数据高度有序
+    if longest >= 96:
+        return 16
 
-    avg = total / runs if runs else 1
-    if avg >= 48 or longest >= 96:
+    # 仅当 512 的结果不确定时才进行更深层采样
+    if n >= 4096 and longest < 24:
+        total = 0
+        lo = 0
+        runs = 0
+        end = min(n, 2048)
+        while lo < end and runs < 12:
+            rl = _count_run_longest(arr, lo, end)
+            total += rl
+            lo += rl
+            runs += 1
+        avg = total // runs if runs else 1
+    else:
+        avg = longest
+
+    if avg >= 48:
         return 16
     if avg >= 24 or longest >= 48:
         return 24
@@ -134,7 +147,6 @@ def _gallop_left(key, arr, base, length):
 class _TimSortState:
     __slots__ = (
         'arr',
-        'tmp',
         'min_gallop',
         'run_base',
         'run_len',
@@ -144,28 +156,52 @@ class _TimSortState:
 
     def __init__(self, arr, min_merge=MIN_MERGE):
         self.arr = arr
-        self.tmp = []
         self.min_gallop = MIN_GALLOP
         self.run_base = []
         self.run_len = []
         self.stack_size = 0
         self.min_merge = min_merge
 
-    def _ensure_tmp(self, needed):
-        if len(self.tmp) < needed:
-            self.tmp = [None] * needed
+    def sort(self):
+        arr = self.arr
+        n = len(arr)
+        if n < 2:
+            return
 
-    def _push_run(self, base, length):
-        self.run_base.append(base)
-        self.run_len.append(length)
-        self.stack_size += 1
+        min_merge = self.min_merge
+        if n < min_merge:
+            _insertion_sort(arr, 0, n)
+            return
+
+        minrun = _compute_minrun(n, min_merge)
+        lo = 0
+        # 缓存 .append 避免每次迭代都进行属性查找
+        push = self.run_base.append
+        push_len = self.run_len.append
+
+        while lo < n:
+            run_hi = _count_run(arr, lo, n)
+            run_len = run_hi - lo
+            if run_len < minrun:
+                force = minrun if lo + minrun <= n else n - lo
+                _insertion_sort(arr, lo, lo + force)
+                run_len = force
+            push(lo)
+            push_len(run_len)
+            self.stack_size += 1
+            self.merge_collapse()
+            lo += run_len
+
+        self.merge_force_collapse()
 
     def _merge_len1(self, lo, mid, hi):
         arr = self.arr
         key = arr[lo]
         pos = _bisect_left(arr, key, mid, hi)
         if pos > mid:
-            arr[lo:pos - 1] = arr[mid:pos]
+            # 跳过单元素 slice 移动
+            if pos > mid + 1:
+                arr[lo:pos - 1] = arr[mid:pos]
             arr[pos - 1] = key
 
     def _merge_len2(self, lo, mid, hi):
@@ -173,15 +209,15 @@ class _TimSortState:
         key = arr[mid]
         pos = _bisect_right(arr, key, lo, mid)
         if pos < mid:
-            arr[pos + 1:hi] = arr[pos:mid]
+            # 跳过单元素 slice 移动
+            if pos < mid - 1:
+                arr[pos + 1:hi] = arr[pos:mid]
             arr[pos] = key
 
     def merge_lo(self, lo, mid, hi):
         arr = self.arr
         left_len = mid - lo
-        self._ensure_tmp(left_len)
-        tmp = self.tmp
-        tmp[:left_len] = arr[lo:mid]
+        tmp = arr[lo:mid]  # 直接切片创建临时数组
 
         i = 0; j = mid
         mg = self.min_gallop
@@ -244,9 +280,7 @@ class _TimSortState:
     def merge_hi(self, lo, mid, hi):
         arr = self.arr
         right_len = hi - mid
-        self._ensure_tmp(right_len)
-        tmp = self.tmp
-        tmp[:right_len] = arr[mid:hi]
+        tmp = arr[mid:hi]  # 直接切片创建临时数组
 
         i = lo; j = 0
         mg = self.min_gallop
@@ -325,7 +359,6 @@ class _TimSortState:
         mid = lo1 + len1
         hi = mid + len2
 
-        # 优化：提前返回已排序的运行对（部分有序数据常见）
         if not (arr[mid] < arr[mid - 1]):
             return
 
@@ -378,40 +411,6 @@ class _TimSortState:
             else:
                 self.merge_at(n)
 
-    def sort(self):
-        arr = self.arr
-        n = len(arr)
-        if n < 2:
-            return
-
-        # 优化：缓存局部变量，减少属性查找
-        min_merge = self.min_merge
-        if n < min_merge:
-            _insertion_sort(arr, 0, n)
-            return
-
-        minrun = _compute_minrun(n, min_merge)
-        lo = 0
-
-        # 缓存方法引用，减少属性查找
-        push_run = self._push_run
-        collapse = self.merge_collapse
-
-        while lo < n:
-            run_hi = _count_run(arr, lo, n)
-            run_len = run_hi - lo
-
-            if run_len < minrun:
-                force = min(minrun, n - lo)
-                _insertion_sort(arr, lo, lo + force)
-                run_len = force
-
-            push_run(lo, run_len)
-            collapse()
-            lo += run_len
-
-        self.merge_force_collapse()
-
 
 class _Reverse:
     __slots__ = ('val',)
@@ -436,15 +435,15 @@ def timsort(arr, *, key=None, reverse=False, min_merge=None):
             wrapped = [(key(x), i, x) for i, x in enumerate(arr)]
         else:
             wrapped = [(_Reverse(x), i, x) for i, x in enumerate(arr)]
-        mm = _choose_min_merge(wrapped) if min_merge is None else min_merge
-        if not isinstance(mm, int) or mm < 2:
+        mm = _choose_min_merge(wrapped, len(wrapped)) if min_merge is None else min_merge
+        if not isinstance(mm, int) or isinstance(mm, bool) or mm < 2:
             raise ValueError("min_merge must be an integer >= 2")
         _TimSortState(wrapped, mm).sort()
         for i, (_, _, v) in enumerate(wrapped):
             arr[i] = v
     else:
-        mm = _choose_min_merge(arr) if min_merge is None else min_merge
-        if not isinstance(mm, int) or mm < 2:
+        mm = _choose_min_merge(arr, len(arr)) if min_merge is None else min_merge
+        if not isinstance(mm, int) or isinstance(mm, bool) or mm < 2:
             raise ValueError("min_merge must be an integer >= 2")
         _TimSortState(arr, mm).sort()
     return arr
