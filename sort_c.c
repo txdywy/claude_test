@@ -107,10 +107,6 @@ static int NAME##_merge_hi(NAME##_ts *ts,                                   \
     l2 = e2 - s2;                                                           \
     if (l2 == 0) return 0;                                                  \
     e1 = s1 + l1;                                                           \
-    /* l1 > l2: right run is smaller. Copy it to tmp and merge backwards.  \
-     * Write largest to a[e2-1], then a[e2-2], etc.                        \
-     * Read from a[e1-1] (last left) and t[l2-1] (last right).            \
-     * Since e2 > e1, writing from the end never overwrites unread data. */ \
     for (size_t x = 0; x < l2; x++) t[x] = a[s2 + x];                      \
     size_t li = e1, ri = l2, dest = e2;                                     \
     while (li > s1 && ri > 0) {                                             \
@@ -119,11 +115,8 @@ static int NAME##_merge_hi(NAME##_ts *ts,                                   \
         else                                                                \
             a[--dest] = a[--li];                                            \
     }                                                                       \
-    /* If left exhausted (li == s1): remaining tmp[0..ri) -> a[s1..s1+ri) */ \
     if (li == s1 && ri > 0)                                                 \
         memmove(&a[s1], t, ri * sizeof(TYPE));                              \
-    /* If right exhausted (ri == 0): remaining left[s1..li) already       \
-     * in place at a[s1..li). No action needed. */                          \
     return 0;                                                               \
 }                                                                           \
                                                                             \
