@@ -63,7 +63,6 @@ typedef struct {                                                            \
     size_t run_base[MAX_STACK];                                             \
     size_t run_len[MAX_STACK];                                              \
     int    stack_size;                                                      \
-    int    min_gallop;                                                      \
 } NAME##_ts;                                                                \
                                                                             \
 static size_t NAME##_lb(TYPE *a, size_t lo, size_t hi, TYPE key) {          \
@@ -115,7 +114,7 @@ static int NAME##_merge_hi(NAME##_ts *ts,                                   \
     for (size_t x = 0; x < l2; x++) t[x] = a[s2 + x];                      \
     size_t li = e1, ri = l2, dest = e2;                                     \
     while (li > s1 && ri > 0) {                                             \
-        if (a[li - 1] < t[ri - 1])                                          \
+        if (!(t[ri - 1] < a[li - 1]))                                       \
             a[--dest] = t[--ri];                                            \
         else                                                                \
             a[--dest] = a[--li];                                            \
@@ -180,7 +179,6 @@ int NAME##_timsort(TYPE *arr, size_t n) {                                   \
     NAME##_ts ts;                                                           \
     memset(&ts, 0, sizeof(ts));                                             \
     ts.array = arr; ts.tmp = tmp;                                           \
-    ts.min_gallop = INIT_GALLOP_THRESH;                                     \
     size_t lo = 0;                                                          \
     while (lo < n) {                                                        \
         size_t rem = n - lo;                                                \
@@ -254,8 +252,7 @@ static size_t gen_count_run(gen_ts *ts, size_t lo, size_t hi) {
 }
 
 static void gen_bin_insertion_sort(gen_ts *ts, size_t lo, size_t hi) {
-    size_t es = ts->es; char *kb = ts->tmp;  /* reuse tmp for key buf (just need 1 elem) */
-    /* Actually tmp is too big, use a separate small buffer */
+    size_t es = ts->es;
     char kbuf[256]; char *k = (es <= 256) ? kbuf : (char *)malloc(es);
     if (!k) return;
     for (size_t i = lo + 1; i < hi; i++) {
@@ -350,7 +347,7 @@ static int gen_merge_hi(gen_ts *ts, size_t s1, size_t l1, size_t s2, size_t l2) 
     for (size_t x = 0; x < l2; x++) memcpy(&t[x * es], &ts->arr[(s2 + x) * es], es);
     size_t li = e1, ri = l2, dest = e2;
     while (li > s1 && ri > 0) {
-        if (ts->cmp(&ts->arr[(li-1)*es], &t[(ri-1)*es]) < 0)
+        if (!(ts->cmp(&t[(ri-1)*es], &ts->arr[(li-1)*es]) < 0))
             { dest--; ri--; memcpy(&ts->arr[dest*es], &t[ri*es], es); }
         else
             { dest--; li--; memcpy(&ts->arr[dest*es], &ts->arr[li*es], es); }
